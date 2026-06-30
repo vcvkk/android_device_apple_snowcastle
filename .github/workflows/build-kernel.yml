@@ -1,212 +1,231 @@
-name: Build kernel & m1n1 for iPhone X (snowcastle)
+name: Build kernel, ramdisk & m1n1 for iPhone X (snowcastle)
 
-# Runs on the free GitHub-hosted ubuntu-latest runner.
-# Produces:
-#   - kernel artifact: Image.gz + Apple DTB files
-#   - m1n1 artifact: m1n1-boot.bin + m1n1-recovery.bin
-#     (only when a release tag with prebuilt ramdisks is specified)
+# Runs on the free GitHub-hosted ubuntu-latest runner (~145 GB disk, 89 GB free).
+# Strategy: partial repo sync of only the repos needed for kernel + ramdisk.
+# Total download: ~15-20 GB. Total build: ~10-15 GB. Well within limits.
 #
-# First run: leave ramdisk_release_tag empty — you get the kernel.
-# After you have ramdisk.img / ramdisk-recovery.img from a full build,
-# upload them to a GitHub Release and pass that tag on the next run.
+# Produces:
+#   - kernel:   Image.gz + Apple DTB files
+#   - m1n1:     m1n1-boot.bin + m1n1-recovery.bin  (if ramdisk build succeeds)
+#
+# The ramdisk build uses the Android build system with a partial source tree.
+# If it fails, kernel artifacts are still uploaded.
 
 on:
   workflow_dispatch:
     inputs:
       lineage_branch:
-        description: 'LineageOS branch (used to fetch kernel config fragments)'
+        description: 'LineageOS source branch'
         required: true
         default: 'lineage-23.2'
         type: string
       llvm_version:
-        description: 'LLVM version for kernel compilation (from github.com/llvm/llvm-project/releases)'
+        description: 'LLVM version (from github.com/llvm/llvm-project/releases)'
         required: true
         default: '19.1.7'
         type: string
-      ramdisk_release_tag:
-        description: 'GitHub Release tag that contains ramdisk.img + ramdisk-recovery.img (leave empty to skip m1n1 assembly)'
-        required: false
-        default: ''
-        type: string
+      build_variant:
+        description: 'Android build variant'
+        required: true
+        default: 'userdebug'
+        type: choice
+        options:
+          - userdebug
+          - user
+          - eng
+
+env:
+  BUILD_DIR: /home/runner/lineage
+  LLVM_DIR: /opt/llvm
 
 jobs:
-  build-kernel:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 360
 
     steps:
-      - name: Free disk space
-        run: |
-          echo "=== Disk space before ==="
-          df -h
-          # Remove large pre-installed packages (~20 GB freed)
-          sudo rm -rf \
-            /usr/local/lib/android \
-            /usr/share/dotnet \
-            /opt/ghc \
-            /usr/local/share/boost \
-            /opt/hostedtoolcache/CodeQL \
-            /usr/local/share/powershell \
-            /usr/share/swift
-          sudo apt-get remove -y \
-            azure-cli google-chrome-stable firefox \
-            microsoft-edge-stable mono-complete \
-            powershell || true
-          sudo apt-get autoremove -y
-          sudo apt-get clean
-          echo "=== Disk space after ==="
-          df -h
+      - name: Show available disk space
+        run: df -h
 
       - name: Checkout device tree
         uses: actions/checkout@v4
+        with:
+          path: device-tree
 
       - name: Install build dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential flex git \
-            libelf-dev libssl-dev python3 rsync
+            bc bison build-essential ccache curl flex \
+            g++-multilib gcc-multilib git git-lfs \
+            libelf-dev liblz4-tool libncurses5-dev \
+            libssl-dev libxml2-utils lzop \
+            openjdk-17-jdk python3 python3-pip \
+            rsync schedtool squashfs-tools \
+            unzip zip zlib1g-dev
 
-      - name: Clone kernel config fragments
+      - name: Setup repo tool
         run: |
-          MAINLINE_CONFIGS=/tmp/kernel-mainline-configs
-          KERNEL_CONFIGS=/tmp/kernel-configs
-
-          # kernel/mainline/configs — LineageOS mainline project
-          # Try known repo names until one succeeds
-          CLONED=false
-          for REPO in \
-            "LineageOS/android_kernel_mainline_configs" \
-            "LineageOS/android_kernel_configs"
-          do
-            if git clone --depth=1 --no-tags \
-                 "https://github.com/$REPO" "$MAINLINE_CONFIGS" 2>/dev/null; then
-              echo "Cloned mainline configs from $REPO"
-              CLONED=true
-              break
-            fi
-          done
-          $CLONED || echo "Warning: kernel/mainline/configs not found — will build with device configs only"
-
-          # kernel/configs — AOSP android-base configs
-          git clone --depth=1 --no-tags \
-            "https://android.googlesource.com/kernel/configs" \
-            "$KERNEL_CONFIGS" 2>/dev/null \
-            || echo "Warning: kernel/configs not found — android-base.config will be skipped"
-
-          echo "MAINLINE_CONFIGS=$MAINLINE_CONFIGS" >> "$GITHUB_ENV"
-          echo "KERNEL_CONFIGS=$KERNEL_CONFIGS"     >> "$GITHUB_ENV"
-
-      - name: Clone HoolockLinux kernel source
-        run: |
-          git clone --depth=1 \
-            https://github.com/HoolockLinux/linux \
-            kernel/apple/HoolockLinux
+          mkdir -p ~/.local/bin
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo \
+            -o ~/.local/bin/repo
+          chmod +x ~/.local/bin/repo
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Download LLVM toolchain
         run: |
-          LLVM_VERSION="${{ inputs.llvm_version }}"
-          LLVM_ARCHIVE="LLVM-${LLVM_VERSION}-Linux-X64.tar.xz"
-          LLVM_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/${LLVM_ARCHIVE}"
-          echo "Downloading LLVM ${LLVM_VERSION}..."
-          curl -fL --retry 3 --retry-delay 5 -o /tmp/llvm.tar.xz "$LLVM_URL"
+          LLVM_VER="${{ inputs.llvm_version }}"
+          echo "Downloading LLVM ${LLVM_VER}..."
+          curl -fL --retry 3 --retry-delay 5 -o /tmp/llvm.tar.xz \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VER}/LLVM-${LLVM_VER}-Linux-X64.tar.xz"
           sudo tar -xJf /tmp/llvm.tar.xz -C /opt/
-          sudo mv "/opt/LLVM-${LLVM_VERSION}-Linux-X64" /opt/llvm
+          sudo mv "/opt/LLVM-${LLVM_VER}-Linux-X64" "${{ env.LLVM_DIR }}"
           rm -f /tmp/llvm.tar.xz
-          echo "/opt/llvm/bin" >> "$GITHUB_PATH"
-          echo "=== Disk space after LLVM download ==="
+          echo "${{ env.LLVM_DIR }}/bin" >> "$GITHUB_PATH"
+
+      - name: Initialize LineageOS workspace
+        run: |
+          mkdir -p "${{ env.BUILD_DIR }}"
+          cd "${{ env.BUILD_DIR }}"
+          repo init \
+            -u https://github.com/LineageOS/android.git \
+            -b ${{ inputs.lineage_branch }} \
+            --depth=1 --no-clone-bundle -q
+
+      - name: Setup local manifest for kernel
+        run: |
+          mkdir -p "${{ env.BUILD_DIR }}/.repo/local_manifests"
+          cat > "${{ env.BUILD_DIR }}/.repo/local_manifests/snowcastle.xml" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <manifest>
+            <remote name="hoolocklinux" fetch="https://github.com/HoolockLinux/" />
+            <project path="kernel/apple/HoolockLinux"
+                     name="linux"
+                     remote="hoolocklinux"
+                     revision="main" />
+          </manifest>
+          EOF
+
+      - name: Sync required source repos (partial)
+        run: |
+          cd "${{ env.BUILD_DIR }}"
+
+          # Sync the repos needed for Android build system + ramdisk + kernel.
+          # Total: ~15-20 GB with --depth=1.
+          repo sync -j$(nproc) --no-clone-bundle --no-tags --force-sync -c \
+            build/make \
+            build/soong \
+            build/blueprint \
+            build/kati \
+            prebuilts/build-tools \
+            bionic \
+            system/core \
+            system/libbase \
+            system/logging \
+            external/boringssl \
+            external/selinux \
+            external/fmtlib \
+            external/libcap \
+            device/mainline/common \
+            device/mainline/generic \
+            vendor/lineage \
+            kernel/apple/HoolockLinux
+
+          # kernel/mainline/configs is optional — not in all manifest versions
+          repo sync -j4 --no-clone-bundle --no-tags -c \
+            kernel/mainline/configs 2>/dev/null \
+            || echo "Note: kernel/mainline/configs not in manifest, skipping"
+
+          echo "=== Disk space after sync ==="
           df -h
+
+      - name: Sync device tree into workspace
+        run: |
+          mkdir -p "${{ env.BUILD_DIR }}/device/apple"
+          rsync -a --delete \
+            "${{ github.workspace }}/device-tree/" \
+            "${{ env.BUILD_DIR }}/device/apple/snowcastle/"
+
+      - name: Setup prebuilt clang (symlink to our LLVM)
+        run: |
+          cd "${{ env.BUILD_DIR }}"
+          # The Android build system looks for clang in prebuilts/clang/host/linux-x86/<version>/
+          # Find the version it expects, then point it to our downloaded LLVM.
+          CLANG_VER=$(grep -oP 'clang-r[a-z0-9]+' \
+            build/soong/cc/config/global.go 2>/dev/null | head -1 \
+            || echo "clang-r536225")
+          echo "Build system expects: $CLANG_VER → symlinking to ${{ env.LLVM_DIR }}"
+          mkdir -p "prebuilts/clang/host/linux-x86"
+          ln -sfn "${{ env.LLVM_DIR }}" "prebuilts/clang/host/linux-x86/$CLANG_VER"
 
       - name: Merge kernel config fragments
         run: |
-          DEVICE_PATH="${{ github.workspace }}"
-          MAINLINE_CONFIGS="${{ env.MAINLINE_CONFIGS }}"
-          KERNEL_CONFIGS="${{ env.KERNEL_CONFIGS }}"
+          cd "${{ env.BUILD_DIR }}"
+          DEVICE="device/apple/snowcastle"
           KDIR="kernel/apple/HoolockLinux"
+          MAINLINE="kernel/mainline/configs"
 
-          # Ordered list of config fragments — same order as BoardConfig.mk
-          # Non-existing fragments are silently skipped
           FRAGMENTS=(
-            "$DEVICE_PATH/configs/kernel/config-postmarketos-apple-4k.aarch64"
-            "$DEVICE_PATH/configs/kernel/apple.config"
-            "$MAINLINE_CONFIGS/fragments/android-base-pre/common.config"
-            "$MAINLINE_CONFIGS/fragments/android-base-pre/arm64.config"
-            "$KERNEL_CONFIGS/b/android-6.12/android-base.config"
-            "$MAINLINE_CONFIGS/fragments/android-base-conditional/CONFIG_ARM64-y.config"
-            "$MAINLINE_CONFIGS/fragments/common.config"
-            "$MAINLINE_CONFIGS/fragments/y/arm64/pagesize-16k.config"
-            "$MAINLINE_CONFIGS/fragments/y/fbcon.config"
-            "$MAINLINE_CONFIGS/fragments/n/disable-clang-hardening-features.config"
-            "$MAINLINE_CONFIGS/fragments/n/faster-build-time.config"
+            "$DEVICE/configs/kernel/config-postmarketos-apple-4k.aarch64"
+            "$DEVICE/configs/kernel/apple.config"
           )
-
-          AVAILABLE=()
-          for f in "${FRAGMENTS[@]}"; do
-            if [ -f "$f" ]; then
-              AVAILABLE+=("$f")
-            else
-              echo "Skipping missing fragment: $f"
-            fi
+          for frag in \
+            "$MAINLINE/fragments/android-base-pre/common.config" \
+            "$MAINLINE/fragments/android-base-pre/arm64.config" \
+            "$MAINLINE/fragments/android-base-conditional/CONFIG_ARM64-y.config" \
+            "$MAINLINE/fragments/common.config" \
+            "$MAINLINE/fragments/y/arm64/pagesize-16k.config" \
+            "$MAINLINE/fragments/y/fbcon.config" \
+            "$MAINLINE/fragments/n/disable-clang-hardening-features.config" \
+            "$MAINLINE/fragments/n/faster-build-time.config"
+          do
+            [ -f "$frag" ] && FRAGMENTS+=("$frag") || echo "Skipping: $frag"
           done
 
-          echo "Merging ${#AVAILABLE[@]} config fragment(s)..."
-          cd "$KDIR"
-          # Use the first fragment as the base config, merge the rest on top
-          cp "${AVAILABLE[0]}" arch/arm64/configs/snowcastle_defconfig
-          if [ ${#AVAILABLE[@]} -gt 1 ]; then
-            scripts/kconfig/merge_config.sh \
-              -m arch/arm64/configs/snowcastle_defconfig \
-              "${AVAILABLE[@]:1}"
-            mv .config arch/arm64/configs/snowcastle_defconfig
+          cp "${FRAGMENTS[0]}" "$KDIR/arch/arm64/configs/snowcastle_defconfig"
+          if [ ${#FRAGMENTS[@]} -gt 1 ]; then
+            (cd "$KDIR" && scripts/kconfig/merge_config.sh \
+              -m arch/arm64/configs/snowcastle_defconfig "${FRAGMENTS[@]:1}")
+            mv "$KDIR/.config" "$KDIR/arch/arm64/configs/snowcastle_defconfig"
           fi
 
       - name: Build kernel
         run: |
-          cd kernel/apple/HoolockLinux
-          MAKE_ARGS=(
-            ARCH=arm64
-            CC=clang
-            LLVM=1
-            LLVM_IAS=1
-            CROSS_COMPILE=aarch64-linux-gnu-
-          )
-          make "${MAKE_ARGS[@]}" snowcastle_defconfig
-          make "${MAKE_ARGS[@]}" -j$(nproc) Image.gz dtbs modules
+          cd "${{ env.BUILD_DIR }}/kernel/apple/HoolockLinux"
+          MAKE=(ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu-)
+          make "${MAKE[@]}" snowcastle_defconfig
+          make "${MAKE[@]}" -j$(nproc) Image.gz dtbs modules
           echo "=== Kernel build complete ==="
           ls -lh arch/arm64/boot/Image.gz
-          echo "DTB files:"
           find arch/arm64/boot/dts/apple/ -name '*.dtb' | sort
 
-      - name: Download prebuilt ramdisks from GitHub Release
-        if: inputs.ramdisk_release_tag != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Build Android ramdisk
+        id: ramdisk
+        continue-on-error: true
         run: |
-          mkdir -p /tmp/ramdisks
-          gh release download "${{ inputs.ramdisk_release_tag }}" \
-            --repo "${{ github.repository }}" \
-            --pattern "ramdisk.img" \
-            --pattern "ramdisk-recovery.img" \
-            --dir /tmp/ramdisks/
-          echo "Downloaded ramdisks:"
-          ls -lh /tmp/ramdisks/
+          cd "${{ env.BUILD_DIR }}"
+          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+          export SNOWCASTLE_PARTITION_SCHEME=normal
+          export TARGET_KERNEL_CLANG_PATH="${{ env.LLVM_DIR }}"
+          export USE_CCACHE=0
 
-      - name: Assemble m1n1-boot.bin and m1n1-recovery.bin
-        if: inputs.ramdisk_release_tag != ''
+          source build/envsetup.sh
+          breakfast lineage_snowcastle-${{ inputs.build_variant }}
+          m -j$(nproc) ramdisk
+
+      - name: Assemble m1n1 boot images
+        if: steps.ramdisk.outcome == 'success'
         run: |
-          KERNEL="kernel/apple/HoolockLinux/arch/arm64/boot/Image.gz"
-          M1N1="prebuilts/m1n1.bin"
+          cd "${{ env.BUILD_DIR }}"
+          KDIR="kernel/apple/HoolockLinux"
+          OUT="out/target/product/snowcastle"
+          M1N1="device/apple/snowcastle/prebuilts/m1n1.bin"
+          KERNEL="$KDIR/arch/arm64/boot/Image.gz"
 
-          # Collect DTB files in sorted order (same as m1n1.mk: find ... -type f -name '*.dtb')
-          mapfile -t DTBS < <(find kernel/apple/HoolockLinux/arch/arm64/boot/dts/apple/ \
+          mapfile -t DTBS < <(find "$KDIR/arch/arm64/boot/dts/apple/" \
                                -type f -name '*.dtb' 2>/dev/null | sort)
+          [ ${#DTBS[@]} -eq 0 ] && echo "Warning: no DTBs found"
 
-          if [ ${#DTBS[@]} -eq 0 ]; then
-            echo "Warning: no DTB files found under dts/apple/"
-          fi
-
-          # Boot args matching BoardConfig.mk (normal partition scheme)
-          # MAINLINE_COMMON_* values are not set here; add them via repo if needed
           COMMON="androidboot.hardware=snowcastle androidboot.serialno=snowcastle"
           COMMON="$COMMON androidboot.verifiedbootstate=orange console=tty0"
 
@@ -215,46 +234,41 @@ jobs:
           BOOT_ARGS="$BOOT_ARGS androidboot.mount_firmware=false"
           BOOT_ARGS="$BOOT_ARGS rdinit=/system/bin/generic_init"
           BOOT_ARGS="$BOOT_ARGS sysctl.kernel.firmware_config.force_sysfs_fallback=1"
-
           RECOVERY_ARGS="$COMMON androidboot.fstab_suffix=normal quiet"
 
-          # Replicate the exact cat command from build/tasks/m1n1.mk
-          cat "$M1N1" \
-            <(echo "chosen.bootargs=$BOOT_ARGS") \
-            "${DTBS[@]}" \
-            "$KERNEL" \
-            /tmp/ramdisks/ramdisk.img \
-            > /tmp/m1n1-boot.bin
+          # Exact same cat command as in build/tasks/m1n1.mk
+          cat "$M1N1" <(echo "chosen.bootargs=$BOOT_ARGS") \
+            "${DTBS[@]}" "$KERNEL" "$OUT/ramdisk.img" \
+            > "$OUT/m1n1-boot.bin"
 
-          cat "$M1N1" \
-            <(echo "chosen.bootargs=$RECOVERY_ARGS") \
-            "${DTBS[@]}" \
-            "$KERNEL" \
-            /tmp/ramdisks/ramdisk-recovery.img \
-            > /tmp/m1n1-recovery.bin
+          cat "$M1N1" <(echo "chosen.bootargs=$RECOVERY_ARGS") \
+            "${DTBS[@]}" "$KERNEL" "$OUT/ramdisk-recovery.img" \
+            > "$OUT/m1n1-recovery.bin"
 
           echo "=== m1n1 images ==="
-          ls -lh /tmp/m1n1-boot.bin /tmp/m1n1-recovery.bin
+          ls -lh "$OUT/m1n1-boot.bin" "$OUT/m1n1-recovery.bin"
 
       - name: Upload kernel artifacts
         uses: actions/upload-artifact@v4
         with:
           name: kernel-${{ github.run_number }}
           path: |
-            kernel/apple/HoolockLinux/arch/arm64/boot/Image.gz
-            kernel/apple/HoolockLinux/arch/arm64/boot/dts/apple/
+            ${{ env.BUILD_DIR }}/kernel/apple/HoolockLinux/arch/arm64/boot/Image.gz
+            ${{ env.BUILD_DIR }}/kernel/apple/HoolockLinux/arch/arm64/boot/dts/apple/
           if-no-files-found: error
           retention-days: 14
 
       - name: Upload m1n1 artifacts
-        if: inputs.ramdisk_release_tag != ''
+        if: steps.ramdisk.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: m1n1-${{ github.run_number }}
-          path: /tmp/m1n1-*.bin
-          if-no-files-found: error
+          path: |
+            ${{ env.BUILD_DIR }}/out/target/product/snowcastle/m1n1-boot.bin
+            ${{ env.BUILD_DIR }}/out/target/product/snowcastle/m1n1-recovery.bin
+          if-no-files-found: warn
           retention-days: 14
 
-      - name: Print disk usage summary
+      - name: Show final disk usage
         if: always()
         run: df -h
