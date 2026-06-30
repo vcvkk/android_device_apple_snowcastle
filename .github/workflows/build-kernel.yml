@@ -110,8 +110,17 @@ jobs:
         run: |
           cd "${{ env.BUILD_DIR }}"
 
+          # The manifest has a <copyfile> from the "trusty" project
+          # (vendor/google/aosp/lk_inc.mk -> lk_inc.mk) that repo applies on EVERY
+          # sync call, regardless of target project. Since trusty is never synced,
+          # this aborts every `repo sync`. Stub it out — Trusty TEE is unused here.
+          mkdir -p trusty/vendor/google/aosp
+          touch trusty/vendor/google/aosp/lk_inc.mk
+
           # Sync projects one-by-one so a missing path doesn't abort the step.
           # build/kati was merged into build/make in Android 10+; not a separate project.
+          # device/mainline/{common,generic} and kernel/mainline/configs are NOT
+          # manifest projects — they're LineageOS extra deps cloned in the next step.
           for proj in \
             build/make \
             build/soong \
@@ -125,8 +134,6 @@ jobs:
             external/selinux \
             external/fmtlib \
             external/libcap \
-            device/mainline/common \
-            device/mainline/generic \
             vendor/lineage \
             kernel/apple/HoolockLinux
           do
@@ -135,13 +142,24 @@ jobs:
               || echo "Note: $proj not in manifest, skipping"
           done
 
-          # kernel/mainline/configs is optional — not in all manifest versions
-          repo sync -j4 --no-clone-bundle --no-tags -c \
-            kernel/mainline/configs 2>/dev/null \
-            || echo "Note: kernel/mainline/configs not in manifest, skipping"
-
           echo "=== Disk space after sync ==="
           df -h
+
+      - name: Clone LineageOS extra dependencies
+        run: |
+          cd "${{ env.BUILD_DIR }}"
+          clone_dep() {
+            local repo="$1" target="$2"
+            if [ ! -d "$target/.git" ]; then
+              git clone --depth=1 "https://github.com/LineageOS/$repo" "$target"
+            else
+              git -C "$target" pull --ff-only
+            fi
+          }
+          mkdir -p device/mainline kernel/mainline
+          clone_dep android_device_mainline_generic device/mainline/generic
+          clone_dep android_device_mainline_common  device/mainline/common
+          clone_dep android_kernel_mainline_configs kernel/mainline/configs
 
       - name: Sync device tree into workspace
         run: |
