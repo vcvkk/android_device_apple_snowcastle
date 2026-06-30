@@ -67,31 +67,35 @@ jobs:
             bc bison build-essential flex git \
             libelf-dev libssl-dev python3 rsync
 
-      - name: Setup repo tool
+      - name: Clone kernel config fragments
         run: |
-          mkdir -p ~/.local/bin
-          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo \
-            -o ~/.local/bin/repo
-          chmod +x ~/.local/bin/repo
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          MAINLINE_CONFIGS=/tmp/kernel-mainline-configs
+          KERNEL_CONFIGS=/tmp/kernel-configs
 
-      - name: Sync kernel config fragments from LineageOS
-        run: |
-          mkdir -p /tmp/lineage-sync
-          cd /tmp/lineage-sync
-          repo init \
-            -u https://github.com/LineageOS/android.git \
-            -b ${{ inputs.lineage_branch }} \
-            --depth=1 \
-            --no-clone-bundle \
-            -q
-          # Sync only the small config-only repos (a few MB each)
-          repo sync \
-            kernel/mainline/configs \
-            kernel/configs \
-            --no-clone-bundle --no-tags -c -q -j4
-          echo "MAINLINE_CONFIGS=/tmp/lineage-sync/kernel/mainline/configs" >> "$GITHUB_ENV"
-          echo "KERNEL_CONFIGS=/tmp/lineage-sync/kernel/configs"            >> "$GITHUB_ENV"
+          # kernel/mainline/configs — LineageOS mainline project
+          # Try known repo names until one succeeds
+          CLONED=false
+          for REPO in \
+            "LineageOS/android_kernel_mainline_configs" \
+            "LineageOS/android_kernel_configs"
+          do
+            if git clone --depth=1 --no-tags \
+                 "https://github.com/$REPO" "$MAINLINE_CONFIGS" 2>/dev/null; then
+              echo "Cloned mainline configs from $REPO"
+              CLONED=true
+              break
+            fi
+          done
+          $CLONED || echo "Warning: kernel/mainline/configs not found — will build with device configs only"
+
+          # kernel/configs — AOSP android-base configs
+          git clone --depth=1 --no-tags \
+            "https://android.googlesource.com/kernel/configs" \
+            "$KERNEL_CONFIGS" 2>/dev/null \
+            || echo "Warning: kernel/configs not found — android-base.config will be skipped"
+
+          echo "MAINLINE_CONFIGS=$MAINLINE_CONFIGS" >> "$GITHUB_ENV"
+          echo "KERNEL_CONFIGS=$KERNEL_CONFIGS"     >> "$GITHUB_ENV"
 
       - name: Clone HoolockLinux kernel source
         run: |
