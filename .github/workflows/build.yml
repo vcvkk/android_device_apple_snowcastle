@@ -1,0 +1,223 @@
+name: Build LineageOS for iPhone X (snowcastle)
+
+on:
+  workflow_dispatch:
+    inputs:
+      partition_scheme:
+        description: 'Partition scheme to build'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - normal
+          - apfs
+      lineage_branch:
+        description: 'LineageOS source branch'
+        required: true
+        default: 'lineage-23.2'
+        type: string
+      llvm_version:
+        description: 'LLVM version for kernel compilation (from releases.llvm.org)'
+        required: true
+        default: '19.1.7'
+        type: string
+      build_variant:
+        description: 'Android build variant'
+        required: true
+        default: 'userdebug'
+        type: choice
+        options:
+          - userdebug
+          - user
+          - eng
+
+env:
+  LINEAGE_DIR: /opt/lineage-build
+  LLVM_BASE_DIR: /opt/llvm-toolchain
+  CCACHE_DIR: /opt/ccache
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Determine build matrix
+        id: set-matrix
+        run: |
+          if [ "${{ inputs.partition_scheme }}" = "both" ]; then
+            echo 'matrix={"scheme":["normal","apfs"]}' >> "$GITHUB_OUTPUT"
+          else
+            echo 'matrix={"scheme":["${{ inputs.partition_scheme }}"]}' >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: prepare
+    runs-on: self-hosted
+    strategy:
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+      fail-fast: false
+    timeout-minutes: 480
+
+    steps:
+      - name: Checkout device tree
+        uses: actions/checkout@v4
+        with:
+          path: device-tree
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex \
+            g++-multilib gcc-multilib git git-lfs gnupg gperf \
+            imagemagick jq lib32ncurses5-dev lib32readline-dev lib32z1-dev \
+            libelf-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev \
+            libssl-dev libxml2 libxml2-utils lzop openjdk-17-jdk \
+            pngcrush python3 python3-pip rsync schedtool squashfs-tools \
+            xsltproc zip zlib1g-dev
+
+      - name: Setup repo tool
+        run: |
+          mkdir -p ~/.local/bin
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo \
+            -o ~/.local/bin/repo
+          chmod +x ~/.local/bin/repo
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Initialize LineageOS workspace
+        run: |
+          mkdir -p "${{ env.LINEAGE_DIR }}"
+          cd "${{ env.LINEAGE_DIR }}"
+          if [ ! -f .repo/manifest.xml ]; then
+            repo init \
+              -u https://github.com/LineageOS/android.git \
+              -b ${{ inputs.lineage_branch }} \
+              --git-lfs \
+              --depth=1
+          fi
+
+      - name: Setup local manifest for kernel
+        run: |
+          mkdir -p "${{ env.LINEAGE_DIR }}/.repo/local_manifests"
+          cat > "${{ env.LINEAGE_DIR }}/.repo/local_manifests/snowcastle.xml" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <manifest>
+            <remote name="hoolocklinux" fetch="https://github.com/HoolockLinux/" />
+            <project path="kernel/apple/HoolockLinux"
+                     name="linux"
+                     remote="hoolocklinux"
+                     revision="main" />
+          </manifest>
+          EOF
+
+      - name: Sync LineageOS source
+        run: |
+          cd "${{ env.LINEAGE_DIR }}"
+          repo sync \
+            -j$(nproc --all) \
+            --no-clone-bundle \
+            --no-tags \
+            --force-sync \
+            -c
+
+      - name: Sync device tree into workspace
+        run: |
+          mkdir -p "${{ env.LINEAGE_DIR }}/device/apple"
+          rsync -a --delete \
+            "${{ github.workspace }}/device-tree/" \
+            "${{ env.LINEAGE_DIR }}/device/apple/snowcastle/"
+
+      - name: Clone device/mainline/generic dependency
+        run: |
+          TARGET="${{ env.LINEAGE_DIR }}/device/mainline/generic"
+          if [ ! -d "$TARGET/.git" ]; then
+            git clone --depth=1 \
+              https://github.com/LineageOS/android_device_mainline_generic \
+              "$TARGET"
+          else
+            git -C "$TARGET" pull --ff-only
+          fi
+
+      - name: Download LLVM toolchain
+        run: |
+          LLVM_VERSION="${{ inputs.llvm_version }}"
+          LLVM_DIR="${{ env.LLVM_BASE_DIR }}/clang-${LLVM_VERSION}"
+          if [ ! -d "$LLVM_DIR" ]; then
+            mkdir -p "${{ env.LLVM_BASE_DIR }}"
+            LLVM_ARCHIVE="LLVM-${LLVM_VERSION}-Linux-X64.tar.xz"
+            LLVM_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/${LLVM_ARCHIVE}"
+            echo "Downloading LLVM ${LLVM_VERSION}..."
+            curl -fL --retry 3 --retry-delay 5 \
+              -o /tmp/llvm.tar.xz \
+              "$LLVM_URL"
+            tar -xJf /tmp/llvm.tar.xz -C "${{ env.LLVM_BASE_DIR }}"
+            mv "${{ env.LLVM_BASE_DIR }}/LLVM-${LLVM_VERSION}-Linux-X64" "$LLVM_DIR"
+            rm -f /tmp/llvm.tar.xz
+            echo "LLVM ${LLVM_VERSION} installed at $LLVM_DIR"
+          else
+            echo "LLVM ${LLVM_VERSION} already cached at $LLVM_DIR"
+          fi
+          echo "TARGET_KERNEL_CLANG_PATH=$LLVM_DIR" >> "$GITHUB_ENV"
+
+      - name: Setup linux-apfs-rw module
+        if: matrix.scheme == 'apfs'
+        run: |
+          MODULES_DIR="${{ env.LINEAGE_DIR }}/kernel/apple/HoolockLinux-modules"
+          APFS_DIR="$MODULES_DIR/linux-apfs-rw"
+          mkdir -p "$MODULES_DIR"
+          if [ ! -d "$APFS_DIR/.git" ]; then
+            git clone https://github.com/linux-apfs/linux-apfs-rw "$APFS_DIR"
+          else
+            git -C "$APFS_DIR" pull --ff-only
+          fi
+          sed -i \
+            's|KERNEL_DIR|KERNEL_SRC|g;s|make |$(MAKE) |g;s|install:|modules_install:|g' \
+            "$APFS_DIR/Makefile"
+
+      - name: Setup ccache
+        run: |
+          mkdir -p "${{ env.CCACHE_DIR }}"
+          ccache --set-config=cache_dir="${{ env.CCACHE_DIR }}"
+          ccache -M 50G
+          ccache -z
+
+      - name: Build LineageOS
+        working-directory: ${{ env.LINEAGE_DIR }}
+        env:
+          SNOWCASTLE_PARTITION_SCHEME: ${{ matrix.scheme }}
+          USE_CCACHE: '1'
+          CCACHE_EXEC: /usr/bin/ccache
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+        run: |
+          source build/envsetup.sh
+          breakfast lineage_snowcastle-${{ inputs.build_variant }}
+          m -j$(nproc --all) m1n1-boot m1n1-recovery systemimage vendorimage
+
+      - name: Collect build artifacts
+        run: |
+          OUT="${{ env.LINEAGE_DIR }}/out/target/product/snowcastle"
+          DEST="${{ github.workspace }}/artifacts/${{ matrix.scheme }}"
+          mkdir -p "$DEST"
+          for f in m1n1-boot.bin m1n1-recovery.bin \
+                   system.img vendor.img boot.img recovery.img; do
+            if [ -f "$OUT/$f" ]; then
+              cp "$OUT/$f" "$DEST/"
+              echo "Collected: $f ($(du -sh "$OUT/$f" | cut -f1))"
+            else
+              echo "Warning: $f not found"
+            fi
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: snowcastle-${{ matrix.scheme }}-${{ github.run_number }}
+          path: artifacts/${{ matrix.scheme }}/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Print ccache statistics
+        if: always()
+        run: ccache -s
